@@ -1,0 +1,6 @@
+# dsh-doubao-bridge bundle patch：把宿主插件插进 profile 的 plugin roster。
+# 用 `dsh plugin --profile desktop add <本目录>` 安装时自动应用；
+# 不要再手工往 profile patch 里插一次（重复 id 会让加载器崩）。
+- insert:
+    - id: dsh-doubao-bridge
+      name: '@local/dsh-doubao-bridge'

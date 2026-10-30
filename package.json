@@ -1,0 +1,22 @@
+﻿{
+    "name":  "@local/dsh-doubao-bridge",
+    "version":  "0.1.0",
+    "private":  false,
+    "type":  "module",
+    "description":  "DSH ↔ 豆包 双向协作桥：把豆包桌面端变成可调度的会话执行体，配一块双方共用的任务板（分工/交付/验收）。",
+    "main":  "index.js",
+    "exports":  {
+                    ".":  "./index.js"
+                },
+    "files":  [
+                  "index.js",
+                  "cordis.patch.yml",
+                  "README.md"
+              ],
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           }
+            },
+    "license":  "MIT"
+}

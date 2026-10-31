@@ -25,7 +25,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -81,18 +81,72 @@ async function jsonFetch(path, opts = {}) {
     const msg = String(error?.message ?? error)
     const transient = /fetch failed|ECONNRESET|ECONNREFUSED|socket hang up|aborted|AbortError|other side closed/i.test(msg)
     if (!transient) throw error
-    await new Promise((r) => setTimeout(r, 500))
-    await ensureServer().catch(() => {})
-    return jsonFetchOnce(path, opts)
+    for (const waitMs of [400, 1200]) {
+      await new Promise((r) => setTimeout(r, waitMs))
+      await ensureServer().catch(() => {})
+      try {
+        return await jsonFetchOnce(path, opts)
+      } catch (retryError) {
+        const retryMsg = String(retryError?.message ?? retryError)
+        if (!/fetch failed|ECONNRESET|ECONNREFUSED|socket hang up|aborted|AbortError|other side closed/i.test(retryMsg)) {
+          throw retryError
+        }
+      }
+    }
+    throw error
   }
 }
 
 async function ping(timeoutMs = 1500) {
+  // 注意：这里必须用 jsonFetchOnce（不带重试），否则 jsonFetch 的重试会再调
+  // ensureServer → ping，形成递归死锁（2026-10-30 实测踩到）。
   try {
-    const { status } = await jsonFetch('/health', { timeoutMs })
+    const { status } = await jsonFetchOnce('/health', { timeoutMs })
     return status === 200
   } catch {
     return false
+  }
+}
+
+/** 找一个能跑 playwright 的 python：优先显式路径，其次常见安装位置，最后 PATH。 */
+function resolvePython() {
+  const explicit = process.env.DOUBAO_BRIDGE_PYTHON
+  const candidates = [
+    explicit,
+    'D:/Python/python.exe',
+    'C:/Python311/python.exe',
+    'C:/Python312/python.exe',
+  ].filter(Boolean)
+  for (const c of candidates) {
+    try {
+      if (existsSync(c)) return c
+    } catch {
+      /* ignore */
+    }
+  }
+  return explicit || 'python'
+}
+
+/** 清掉可能污染子进程的 PYTHON* 变量（宿主环境里被设过 PYTHONPATH 会让依赖解析失败）。 */
+function cleanEnv() {
+  const env = { ...process.env }
+  for (const k of ['PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONUSERBASE', 'PYTHONEXECUTABLE']) {
+    delete env[k]
+  }
+  env.PYTHONIOENCODING = 'utf-8'
+  env.PYTHONUNBUFFERED = '1'
+  return env
+}
+
+/** 读桥服务 stdout 日志的最后几行，用于把失败原因回给调用方。 */
+function tailServerLog(lines = 20) {
+  const home = process.env.LOCALAPPDATA || ''
+  const file = `${home}\\DSHDoubaoBridge\\server.out.log`
+  try {
+    const text = readFileSync(file, 'utf8')
+    return text.trimEnd().split('\n').slice(-lines).join('\n')
+  } catch {
+    return ''
   }
 }
 
@@ -108,29 +162,55 @@ async function ensureServer() {
     if (!existsSync(server)) {
       return { ok: false, started: false, detail: `找不到桥服务脚本：${server}` }
     }
-    const python = process.env.DOUBAO_BRIDGE_PYTHON || 'python'
+    const python = resolvePython()
+    let childExit = ''
     try {
       const child = spawn(python, [server], {
         cwd: dir,
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+        env: cleanEnv(),
+      })
+      child.on('exit', (code, signal) => {
+        childExit = `子进程退出 code=${code} signal=${signal || ''}`
       })
       child.unref()
     } catch (error) {
-      return { ok: false, started: false, detail: `启动桥服务失败：${String(error?.message ?? error)}` }
+      return { ok: false, started: false, detail: `启动桥服务失败（${python}）：${String(error?.message ?? error)}` }
     }
-    // 等服务就绪（豆包冷启动 + CDP 连接大约 5-15s）
-    for (let i = 0; i < 40; i += 1) {
+    // 等服务就绪（豆包冷启动 + CDP 连接大约 5-15s；启动期给 60s）
+    for (let i = 0; i < 60; i += 1) {
       await new Promise((r) => setTimeout(r, 1000))
-      if (await ping(1000)) return { ok: true, started: true, detail: '桥服务已启动' }
+      if (await ping(1000)) {
+        return { ok: true, started: true, detail: `桥服务已启动（python=${python}）` }
+      }
+      if (childExit) break
     }
-    return { ok: false, started: true, detail: '桥服务启动超时（40s），看 %LOCALAPPDATA%\\DSHDoubaoBridge\\server.log' }
+    const tail = tailServerLog(15)
+    return {
+      ok: false,
+      started: true,
+      detail: [
+        '桥服务启动超时/失败',
+        childExit || undefined,
+        `python=${python}`,
+        tail ? `日志尾部：\n${tail}` : '（server.out.log 为空）',
+      ].filter(Boolean).join('\n'),
+    }
   })().finally(() => {
     ensuring = null
   })
-  return ensuring
+  // 兜底看门狗：万一以后再有循环/卡死，不让工具调用无限挂住，超时后明确报错
+  return Promise.race([
+    ensuring,
+    new Promise((resolve) =>
+      setTimeout(
+        () => resolve({ ok: false, started: true, detail: '桥服务启动超时（150s 看门狗触发）；看 %LOCALAPPDATA%\DSHDoubaoBridge\server.out.log' }),
+        150000,
+      ).unref?.(),
+    ),
+  ])
 }
 
 function fail(message) {
@@ -149,13 +229,23 @@ function sessionOf(exec) {
 async function doStatus() {
   const ready = await ensureServer()
   if (!ready.ok) return textOf({ ok: false, server: ready })
-  const [{ data: st }] = await Promise.all([jsonFetch('/status', { timeoutMs: 120000 })])
+  let st = {}
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { data } = await jsonFetch('/status', { timeoutMs: 120000 })
+    st = data || {}
+    if (st.port) break
+    await new Promise((r) => setTimeout(r, 3000))
+  }
+  const readyNow = st.port ? true : false
   return textOf({
     ok: true,
     bridge: ready,
     doubao: { logged_in: st.logged_in, cdp_port: st.port, page: st.page },
     board: st.board,
-    hint: st.logged_in ? undefined : '豆包未登录：打开桥接豆包窗口点「登录」（登录态是本机设备级的，通常自动完成）',
+    busy: st.stale ? { current: st.busy, busy_s: st.busy_s } : undefined,
+    hint: readyNow
+      ? (st.logged_in ? undefined : '豆包未登录：打开桥接豆包窗口点「登录」（登录态是本机设备级的，通常自动完成）')
+      : `桥服务在，但豆包还没就绪${st.busy ? `（正忙：${st.busy} ${st.busy_s}s）` : ''}；稍等几秒再查，或看 %LOCALAPPDATA%\DSHDoubaoBridge\server.out.log`,
   })
 }
 
@@ -191,7 +281,10 @@ async function doDispatch(args, exec) {
   })
   const tid = created?.data?.task_id
   if (!tid) return fail(`建任务失败: ${JSON.stringify(created?.data)}`)
-  const started = await jsonFetch('/coop/dispatch', { method: 'POST', body: { task_id: tid, timeout } })
+  const started = await jsonFetch('/coop/dispatch', {
+    method: 'POST',
+    body: { task_id: tid, timeout, mode: String(args?.mode ?? '') },
+  })
   if (started?.data?.ok === false) return textOf({ ok: false, task_id: tid, error: started.data })
 
   // 可选：等一段时间，看它是不是已经干完（不阻塞太久，默认 0=立即返回）
@@ -225,6 +318,59 @@ async function doTaskStatus(args) {
   const ready = await ensureServer()
   if (!ready.ok) return textOf({ ok: false, server: ready })
   const { data } = await jsonFetch(`/coop/status?task_id=${encodeURIComponent(tid)}`, { timeoutMs: 15000 })
+  return textOf(data)
+}
+
+async function doMedia(args, forcedKind) {
+  const ready = await ensureServer()
+  if (!ready.ok) return textOf({ ok: false, server: ready })
+  const action = String(args?.action ?? 'plan')
+  const kind = String(forcedKind || args?.kind || 'video')
+  if (action === 'plan') {
+    const { data } = await jsonFetch('/media/plan', {
+      method: 'POST', timeoutMs: 30000,
+      body: {
+        kind,
+        text: String(args?.text ?? ''),
+        title: String(args?.title ?? ''),
+        channel: String(args?.channel ?? ''),
+      },
+    })
+    return textOf({
+      ...data,
+      must_show_user: data?.ok
+        ? `预计额度 ${data.quota_estimate}（${data.quota_level}档）/ 预计耗时 ${data.eta_min} 分钟 / 规格 ${JSON.stringify(data.spec)}；今日已用 ${data.used_today}/${data.daily_limit}；等用户明确同意后调 ${kind === 'image' ? 'doubao_image' : 'doubao_video'} action=authorize plan_id=${data.plan_id}`
+        : undefined,
+    })
+  }
+  if (action === 'authorize') {
+    const { data } = await jsonFetch('/media/authorize', {
+      method: 'POST', timeoutMs: 30000,
+      body: { plan_id: String(args?.plan_id ?? ''), approve: args?.approve !== false },
+    })
+    return textOf(data)
+  }
+  if (action === 'status') {
+    const { data } = await jsonFetch(`/media/status?plan_id=${encodeURIComponent(String(args?.plan_id ?? ''))}`, { timeoutMs: 20000 })
+    return textOf(data)
+  }
+  return fail('action 只能是 plan / authorize / status')
+}
+
+const doVideo = (args) => doMedia(args, 'video')
+const doImage = (args) => doMedia(args, 'image')
+
+async function doMode(args) {
+  const ready = await ensureServer()
+  if (!ready.ok) return textOf({ ok: false, server: ready })
+  const action = String(args?.action ?? 'get')
+  if (action === 'set') {
+    const name = String(args?.name ?? '').trim()
+    if (!name) return fail('set 需要 name（本地电脑 / 云电脑 / 悦星 / 对话）')
+    const { data } = await jsonFetch('/mode/set', { method: 'POST', timeoutMs: 120000, body: { name } })
+    return textOf(data)
+  }
+  const { data } = await jsonFetch('/mode', { timeoutMs: 90000 })
   return textOf(data)
 }
 
@@ -357,12 +503,30 @@ async function doBoard(args) {
 
 // ---------------------------------------------------------------- 工具定义
 function def(name, description, parameters, execute) {
+  const TOOL_DEADLINE_MS = 240000   // 工具调用硬性上限：再慢也必须在 4 分钟内返回
   return {
     name,
     description,
     parameters,
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
-    execute,
+    async execute(args, exec) {
+      let timer
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve(JSON.stringify({
+            ok: false,
+            deadline_exceeded: true,
+            message: '工具调用超过 240s 硬上限，已中止等待；桥可能卡住，看 %LOCALAPPDATA%\DSHDoubaoBridge\server.out.log（看门狗会在卡死后重启桥）',
+          }, null, 2)),
+          TOOL_DEADLINE_MS,
+        )
+      })
+      try {
+        return await Promise.race([Promise.resolve(execute(args, exec)), deadline])
+      } finally {
+        clearTimeout(timer)
+      }
+    },
   }
 }
 
@@ -398,6 +562,7 @@ const TOOLS = [
         spec_file: { type: 'string', description: '可选：已有任务书文件路径（比 detail 更省 token，迭代时优先用）' },
         timeout_s: { type: 'number', description: '豆包干活上限秒数，默认 900' },
         wait_s: { type: 'number', description: '可选：最多原地等多少秒（默认 0=立即返回，靠 status 轮询更省）' },
+        mode: { type: 'string', enum: ['local', 'cloud', '悦星', '对话'], description: '可选：工作模式——local=本地电脑（默认）、cloud=云电脑（豆包云端跑，本地不动）、悦星=悦星、对话=普通对话。按实际需要选。' },
       },
       required: ['title'],
     },
@@ -412,6 +577,49 @@ const TOOLS = [
       required: ['task_id'],
     },
     doTaskStatus,
+  ),
+  def(
+    'doubao_image',
+    '图片生成（一次一票授权制）。plan=先出「预计额度 + 预计耗时 + 规格 + 今日已用次数」，不执行；必须先把这几项报给用户并得到明确同意；authorize=消费票才开跑（一次性、10 分钟有效、未授权不执行）；status=看阶段与进度。channel=chat 用对话模式（更省额度），channel=work 用工作任务模式。执行后不打断，超时写 alerts 并告警。',
+    {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['plan', 'authorize', 'status'], description: '默认 plan' },
+        text: { type: 'string', description: 'plan 用：图片需求（尺寸/张数/风格）' },
+        title: { type: 'string', description: 'plan 用：任务标题' },
+        channel: { type: 'string', enum: ['chat', 'work'], description: 'plan 用：执行通道，chat=对话模式（白嫖额度）、work=工作任务模式' },
+        plan_id: { type: 'string', description: 'authorize/status 用' },
+        approve: { type: 'boolean', description: 'authorize 用：true=授权，false=拒绝' },
+      },
+    },
+    doImage,
+  ),
+  def(
+    'doubao_video',
+    '视频生成（一次一票授权制）。plan=先出「预计额度 + 预计耗时 + 规格」拿 plan_id（不执行）；必须先把这三个数字报给用户并得到明确同意；authorize=消费这张票才开始跑（一次性、10 分钟有效、未授权一律不跑）；status=看阶段与进度百分比。开始执行后不打断，直到生成完成/产物落盘/总超时 40 分钟，超时写 alerts 并告警。',
+    {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['plan', 'authorize', 'status'], description: '默认 plan' },
+        text: { type: 'string', description: 'plan 用：视频需求描述（含分辨率/时长/数量）' },
+        title: { type: 'string', description: 'plan 用：任务标题' },
+        plan_id: { type: 'string', description: 'authorize/status 用' },
+        approve: { type: 'boolean', description: 'authorize 用：true=授权执行，false=拒绝' },
+      },
+    },
+    doVideo,
+  ),
+  def(
+    'doubao_mode',
+    '查看/切换豆包「工作模式」：get=当前模式+可选（对话/工作任务·本地电脑/云电脑/悦星）；set 传 name。本地电脑=在你这台机器上跑、能动本地文件；云电脑=在豆包云端跑、不碰本地；按实际需要选。派单时也可以直接在 doubao_dispatch 里传 mode。',
+    {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get', 'set'], description: '默认 get' },
+        name: { type: 'string', enum: ['本地电脑', '云电脑', '悦星', '对话'], description: 'set 时必填' },
+      },
+    },
+    doMode,
   ),
   def(
     'doubao_account',
@@ -529,3 +737,6 @@ export function apply(ctx) {
     }
   }
 }
+
+// 供自检脚本直接调用（不影响插件注册）
+export { ensureServer, resolvePython }

@@ -1,6 +1,3 @@
-> 本仓库是 DSH 豆包协作桥插件。安装：`dsh plugin --profile desktop add "<本仓库目录>"`。
-> 配置：可用 `DOUBAO_BRIDGE_DIR`、`DOUBAO_BRIDGE_URL`、`DOUBAO_BRIDGE_PYTHON` 指定桥服务位置。
-> 需要本机运行豆包桥服务和登录态；插件本身不保存登录凭据。
 # dsh-doubao-bridge（DSH 宿主插件）
 
 把 `doubao_bridge/` 里的协作桥注册成 **8 个 DSH 原生工具**，任何 DSH 会话无需额外配置即可：
@@ -9,7 +6,7 @@
 ## 安装
 
 ```bat
-dsh plugin --profile desktop add "<本仓库目录>"
+dsh plugin --profile desktop add "C:\Users\wang'xing\Documents\deepseek-harness\default-workspace\plugins\dsh-doubao-bridge"
 ```
 
 安装后 DSH 会热加载（无需重启），工具出现在下一个回合的工具列表里。
